@@ -1,6 +1,6 @@
 import io
 from collections import Counter
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -106,17 +106,53 @@ def normalize_sap_series(series: pd.Series) -> pd.Series:
     return out
 
 
-def read_sap_file(uploaded_file) -> Tuple[Dict[str, Set[int]], str, int, Dict[str, Dict[str, str]]]:
-    """Liest die SAP-Datei: Spalte A = SAP, C = Name, D = Straße, F = Ort,
-    G = Liefertag 1..6. Keine Filterung – alle SAP-Nummern werden übernommen."""
+def normalize_header_name(value) -> str:
+    """Vereinfacht Spaltenüberschriften für robuste Erkennung."""
+    text = "" if value is None or pd.isna(value) else str(value)
+    text = text.strip().lower()
+    text = (
+        text.replace("ä", "ae")
+        .replace("ö", "oe")
+        .replace("ü", "ue")
+        .replace("ß", "ss")
+    )
+    return "".join(ch for ch in text if ch.isalnum())
+
+
+def pick_first_matching_column(columns: List[str], candidates: List[str]) -> Optional[str]:
+    candidate_set = set(candidates)
+    for column in columns:
+        if normalize_header_name(column) in candidate_set:
+            return column
+    return None
+
+
+def value_to_clean_text(value) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
+def merge_customer_info(base: Dict[str, Dict[str, str]], sap: str, info: Dict[str, str]) -> None:
+    target = base.setdefault(sap, {"name": "", "strasse": "", "ort": ""})
+    for key in ["name", "strasse", "ort"]:
+        if not target.get(key) and info.get(key):
+            target[key] = info[key]
+
+
+def read_sap_file(uploaded_file) -> Tuple[Dict[str, Set[int]], str, int]:
+    """Liest die SAP-Datei: Spalte A = SAP, G = Liefertag 1..6.
+    Name, Straße und Ort werden bewusst nicht aus SAP übernommen."""
     excel = pd.ExcelFile(uploaded_file)
     sheet_name = excel.sheet_names[0]
     df = pd.read_excel(
         excel,
         sheet_name=sheet_name,
         header=0,
-        usecols=[SAP_COL_INDEX, 2, 3, 5, SAP_DAY_COL_INDEX],
-        names=["sap", "name", "strasse", "ort", "tag"],
+        usecols=[SAP_COL_INDEX, SAP_DAY_COL_INDEX],
+        names=["sap", "tag"],
     )
 
     df["sap"] = normalize_sap_series(df["sap"])
@@ -134,45 +170,106 @@ def read_sap_file(uploaded_file) -> Tuple[Dict[str, Set[int]], str, int, Dict[st
         filtered.groupby("sap")["tag_int"].agg(set).to_dict()
     )
 
-    # Kundeninfo (Name/Straße/Ort) – erster Treffer pro SAP
-    info_rows = df[df["sap"].ne("")].drop_duplicates(subset="sap", keep="first")
-    customer_info: Dict[str, Dict[str, str]] = {}
-    for _, row in info_rows.iterrows():
-        customer_info[row["sap"]] = {
-            "name": "" if pd.isna(row["name"]) else str(row["name"]).strip(),
-            "strasse": "" if pd.isna(row["strasse"]) else str(row["strasse"]).strip(),
-            "ort": "" if pd.isna(row["ort"]) else str(row["ort"]).strip(),
-        }
-
-    return days_by_sap, sheet_name, len(filtered), customer_info
+    return days_by_sap, sheet_name, len(filtered)
 
 
-def read_tourenplanung(uploaded_file) -> Tuple[pd.DataFrame, List[str]]:
+def read_tourenplanung(uploaded_file) -> Tuple[pd.DataFrame, List[str], Dict[str, Dict[str, str]]]:
     """Liest die ersten vier Blätter der Tourenplanung und gibt einen langen
-    DataFrame zurück: eine Zeile pro (SAP, Tag, Blatt) mit gesetztem Wert."""
+    DataFrame zurück: eine Zeile pro (SAP, Tag, Blatt) mit gesetztem Wert.
+    Zusätzlich werden Name, Straße und Ort möglichst aus den Überschriften der
+    Tourenplanung erkannt und pro SAP gesammelt."""
     excel = pd.ExcelFile(uploaded_file)
     sheet_names = excel.sheet_names[:4]
 
-    usecols = [TOUR_SAP_COL_INDEX] + list(DAY_COLUMNS_TOUR.values())
-    names = ["sap"] + [f"tag_{d}" for d in DAY_COLUMNS_TOUR.keys()]
-
     frames: List[pd.DataFrame] = []
+    customer_info: Dict[str, Dict[str, str]] = {}
+
     for sheet_name in sheet_names:
-        df = pd.read_excel(
-            excel,
-            sheet_name=sheet_name,
-            header=0,
-            usecols=usecols,
-            names=names,
-        )
+        df = pd.read_excel(excel, sheet_name=sheet_name, header=0)
         if df.empty:
             continue
-        df["sap"] = normalize_sap_series(df["sap"])
-        df["blatt"] = sheet_name
 
-        long = df.melt(
+        columns = list(df.columns)
+        sap_column = columns[TOUR_SAP_COL_INDEX] if len(columns) > TOUR_SAP_COL_INDEX else None
+        if sap_column is None:
+            continue
+
+        name_column = pick_first_matching_column(
+            columns,
+            ["name", "kundenname", "marktname", "kunde", "bezeichnung", "filialname"],
+        )
+        strasse_column = pick_first_matching_column(
+            columns,
+            ["strasse", "str", "anschrift", "adresse", "strassenname", "strassehausnummer"],
+        )
+        ort_column = pick_first_matching_column(
+            columns,
+            ["ort", "stadt", "plzort", "ortname"],
+        )
+        plz_column = pick_first_matching_column(
+            columns,
+            ["plz", "postleitzahl"],
+        )
+
+        rename_map = {sap_column: "sap"}
+        for day_num, col_index in DAY_COLUMNS_TOUR.items():
+            if len(columns) > col_index:
+                rename_map[columns[col_index]] = f"tag_{day_num}"
+
+        if name_column and name_column != sap_column:
+            rename_map[name_column] = "name"
+        if strasse_column and strasse_column != sap_column:
+            rename_map[strasse_column] = "strasse"
+        if ort_column and ort_column != sap_column:
+            rename_map[ort_column] = "ort"
+        if plz_column and plz_column != sap_column:
+            rename_map[plz_column] = "plz"
+
+        work = df.rename(columns=rename_map).copy()
+        work["sap"] = normalize_sap_series(work["sap"])
+        work = work[work["sap"].ne("")].copy()
+        if work.empty:
+            continue
+
+        if "ort" not in work.columns:
+            work["ort"] = ""
+        if "plz" not in work.columns:
+            work["plz"] = ""
+        if "name" not in work.columns:
+            work["name"] = ""
+        if "strasse" not in work.columns:
+            work["strasse"] = ""
+
+        info_cols = ["sap", "name", "strasse", "ort", "plz"]
+        info_df = work[info_cols].copy()
+        info_df["name"] = info_df["name"].map(value_to_clean_text)
+        info_df["strasse"] = info_df["strasse"].map(value_to_clean_text)
+        info_df["ort"] = info_df["ort"].map(value_to_clean_text)
+        info_df["plz"] = info_df["plz"].map(value_to_clean_text)
+        info_df["ort_kombi"] = info_df.apply(
+            lambda row: " ".join(v for v in [row["plz"], row["ort"]] if v).strip(),
+            axis=1,
+        )
+
+        for _, row in info_df.iterrows():
+            merge_customer_info(
+                customer_info,
+                row["sap"],
+                {
+                    "name": row["name"],
+                    "strasse": row["strasse"],
+                    "ort": row["ort_kombi"] or row["ort"],
+                },
+            )
+
+        day_value_columns = [f"tag_{d}" for d in DAY_COLUMNS_TOUR.keys() if f"tag_{d}" in work.columns]
+        if not day_value_columns:
+            continue
+
+        work["blatt"] = sheet_name
+        long = work.melt(
             id_vars=["sap", "blatt"],
-            value_vars=[f"tag_{d}" for d in DAY_COLUMNS_TOUR.keys()],
+            value_vars=day_value_columns,
             var_name="tag_col",
             value_name="wert",
         )
@@ -183,9 +280,9 @@ def read_tourenplanung(uploaded_file) -> Tuple[pd.DataFrame, List[str]]:
         frames.append(long[["sap", "blatt", "tag_num", "wert"]])
 
     if not frames:
-        return pd.DataFrame(columns=["sap", "blatt", "tag_num", "wert"]), sheet_names
+        return pd.DataFrame(columns=["sap", "blatt", "tag_num", "wert"]), sheet_names, customer_info
 
-    return pd.concat(frames, ignore_index=True), sheet_names
+    return pd.concat(frames, ignore_index=True), sheet_names, customer_info
 
 
 def build_missing_in_sap(
@@ -429,6 +526,7 @@ st.title("Tourenplanung gegen SAP – alle SAP-Nummern")
 st.write(
     "Vergleicht die Liefertage in der Tourenplanung gegen die in SAP hinterlegten Liefertage "
     "für alle SAP-Nummern ohne Filter. "
+    "Name, Straße und Ort werden dabei aus der Tourenplanung gelesen. "
     "Kunden, die in den hinterlegten Standorten (Malchow, Neumünster, Zarrentin) gelistet sind, "
     "landen im Blatt **Hupa**. Alle anderen im Blatt **Direkt**."
 )
@@ -463,13 +561,13 @@ with st.expander("Hinterlegte Kundenliste (Hupa)", expanded=False):
     )
 
 sap_datei = st.file_uploader(
-    "SAP hochladen – erstes Blatt, Spalte A = SAP Nummer, C = Name, D = Straße, F = Ort, G = Liefertag 1 bis 6",
+    "SAP hochladen – erstes Blatt, Spalte A = SAP Nummer, G = Liefertag 1 bis 6",
     type=["xlsx", "xlsm", "xls"],
     key="sap_datei",
 )
 
 tourenplanung_datei = st.file_uploader(
-    "Tourenplanung hochladen – erste 4 Blätter, Spalte B = SAP Nummer, Spalte G bis L = Montag bis Samstag",
+    "Tourenplanung hochladen – erste 4 Blätter, Spalte B = SAP Nummer, Spalte G bis L = Montag bis Samstag. Name, Straße und Ort werden ebenfalls hieraus gelesen.",
     type=["xlsx", "xlsm", "xls"],
     key="tourenplanung_datei",
 )
@@ -489,8 +587,8 @@ if run:
         st.stop()
 
     try:
-        days_by_sap, sap_sheet, sap_rows, customer_info = read_sap_file(sap_datei)
-        tour_df, tour_sheets = read_tourenplanung(tourenplanung_datei)
+        days_by_sap, sap_sheet, sap_rows = read_sap_file(sap_datei)
+        tour_df, tour_sheets, customer_info = read_tourenplanung(tourenplanung_datei)
 
         missing_sap = build_missing_in_sap(tour_df, days_by_sap, customer_info)
         missing_tour = build_missing_in_tour(tour_df, days_by_sap, customer_info) if include_reverse else None
