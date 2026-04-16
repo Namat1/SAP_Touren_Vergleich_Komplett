@@ -106,17 +106,17 @@ def normalize_sap_series(series: pd.Series) -> pd.Series:
     return out
 
 
-def read_sap_file(uploaded_file) -> Tuple[Dict[str, Set[int]], str, int]:
-    """Liest die SAP-Datei: Spalte A = SAP, Spalte G = Liefertag 1..6.
-    Keine Filterung – alle SAP-Nummern werden übernommen."""
+def read_sap_file(uploaded_file) -> Tuple[Dict[str, Set[int]], str, int, Dict[str, Dict[str, str]]]:
+    """Liest die SAP-Datei: Spalte A = SAP, C = Name, D = Straße, F = Ort,
+    G = Liefertag 1..6. Keine Filterung – alle SAP-Nummern werden übernommen."""
     excel = pd.ExcelFile(uploaded_file)
     sheet_name = excel.sheet_names[0]
     df = pd.read_excel(
         excel,
         sheet_name=sheet_name,
         header=0,
-        usecols=[SAP_COL_INDEX, SAP_DAY_COL_INDEX],
-        names=["sap", "tag"],
+        usecols=[SAP_COL_INDEX, 2, 3, 5, SAP_DAY_COL_INDEX],
+        names=["sap", "name", "strasse", "ort", "tag"],
     )
 
     df["sap"] = normalize_sap_series(df["sap"])
@@ -134,7 +134,17 @@ def read_sap_file(uploaded_file) -> Tuple[Dict[str, Set[int]], str, int]:
         filtered.groupby("sap")["tag_int"].agg(set).to_dict()
     )
 
-    return days_by_sap, sheet_name, len(filtered)
+    # Kundeninfo (Name/Straße/Ort) – erster Treffer pro SAP
+    info_rows = df[df["sap"].ne("")].drop_duplicates(subset="sap", keep="first")
+    customer_info: Dict[str, Dict[str, str]] = {}
+    for _, row in info_rows.iterrows():
+        customer_info[row["sap"]] = {
+            "name": "" if pd.isna(row["name"]) else str(row["name"]).strip(),
+            "strasse": "" if pd.isna(row["strasse"]) else str(row["strasse"]).strip(),
+            "ort": "" if pd.isna(row["ort"]) else str(row["ort"]).strip(),
+        }
+
+    return days_by_sap, sheet_name, len(filtered), customer_info
 
 
 def read_tourenplanung(uploaded_file) -> Tuple[pd.DataFrame, List[str]]:
@@ -181,6 +191,7 @@ def read_tourenplanung(uploaded_file) -> Tuple[pd.DataFrame, List[str]]:
 def build_missing_in_sap(
     tour_df: pd.DataFrame,
     days_by_sap: Dict[str, Set[int]],
+    customer_info: Dict[str, Dict[str, str]],
 ) -> pd.DataFrame:
     """Eine Zeile pro Kunde: welche Tage stehen in der Tourenplanung, fehlen aber
     in SAP als Liefertag. Keine Restriktion auf Kundengruppen – alle SAP-Nummern."""
@@ -208,6 +219,9 @@ def build_missing_in_sap(
     )
 
     agg["Standort"] = agg["sap"].map(CUSTOMER_TO_LOCATION).fillna("Direkt")
+    agg["Name"] = agg["sap"].map(lambda s: customer_info.get(s, {}).get("name", ""))
+    agg["Straße"] = agg["sap"].map(lambda s: customer_info.get(s, {}).get("strasse", ""))
+    agg["Ort"] = agg["sap"].map(lambda s: customer_info.get(s, {}).get("ort", ""))
     agg["Fehlende LT"] = agg["tage"].map(
         lambda tage: ", ".join(f"{d} {DAY_NAMES[d]}" for d in tage)
     )
@@ -219,7 +233,6 @@ def build_missing_in_sap(
         lambda s: ", ".join(f"{d} {DAY_NAMES[d]}" for d in sorted(days_in_tour.get(s, set())))
     )
 
-    # Hupa-SAPs kennen einen Standort aus CUSTOMER_GROUPS, Direkt-SAPs nicht.
     agg["_HupaFlag"] = agg["sap"].isin(SELECTED_SAPS)
     agg["_StandortSort"] = agg["Standort"].map(LOCATION_ORDER).fillna(999)
     agg["_SapSort"] = pd.to_numeric(agg["sap"], errors="coerce").fillna(9_999_999_999)
@@ -234,6 +247,7 @@ def build_missing_in_sap(
 def build_missing_in_tour(
     tour_df: pd.DataFrame,
     days_by_sap: Dict[str, Set[int]],
+    customer_info: Dict[str, Dict[str, str]],
 ) -> pd.DataFrame:
     """Eine Zeile pro Kunde: welche Tage sind in SAP als Liefertag hinterlegt,
     fehlen aber in der Tourenplanung. Keine Restriktion auf Kundengruppen."""
@@ -248,9 +262,13 @@ def build_missing_in_tour(
         if not fehlend:
             continue
         standort = CUSTOMER_TO_LOCATION.get(sap, "Direkt")
+        info = customer_info.get(sap, {})
         rows.append({
             "Standort": standort,
             "SAP Nummer": sap,
+            "Name": info.get("name", ""),
+            "Straße": info.get("strasse", ""),
+            "Ort": info.get("ort", ""),
             "Fehlende LT": ", ".join(f"{d} {DAY_NAMES[d]}" for d in fehlend),
             "LT SAP": ", ".join(
                 f"{d} {DAY_NAMES[d]}" for d in sorted(sap_days)
@@ -291,6 +309,9 @@ def _export_columns_missing() -> List[str]:
     return [
         "Standort",
         "SAP Nummer",
+        "Name",
+        "Straße",
+        "Ort",
         "Fehlende LT",
         "LT SAP",
         "LT Tourenplanung",
@@ -301,6 +322,9 @@ def _export_columns_missing_tour() -> List[str]:
     return [
         "Standort",
         "SAP Nummer",
+        "Name",
+        "Straße",
+        "Ort",
         "Fehlende LT",
         "LT SAP",
         "LT Tourenplanung",
@@ -418,7 +442,7 @@ if duplicates:
 
 st.info(
     "Richtung des Vergleichs:\n"
-    "- SAP = Datei mit SAP Nummer in A und Liefertag in G\n"
+    "- SAP = Datei mit SAP Nummer in A, Name in C, Straße in D, Ort in F, Liefertag in G\n"
     "- Tourenplanung = Datei mit Spalte B sowie Montag bis Samstag in G bis L\n"
     "- Ausgabe = zwei Blätter, Hupa (bekannte Standorte) und Direkt (Rest)\n"
     "- Sortierung Hupa = Standort Malchow/Neumünster/Zarrentin, dann SAP-Nummer\n"
@@ -439,7 +463,7 @@ with st.expander("Hinterlegte Kundenliste (Hupa)", expanded=False):
     )
 
 sap_datei = st.file_uploader(
-    "SAP hochladen – erstes Blatt, Spalte A = SAP Nummer, Spalte G = Liefertag 1 bis 6",
+    "SAP hochladen – erstes Blatt, Spalte A = SAP Nummer, C = Name, D = Straße, F = Ort, G = Liefertag 1 bis 6",
     type=["xlsx", "xlsm", "xls"],
     key="sap_datei",
 )
@@ -465,11 +489,11 @@ if run:
         st.stop()
 
     try:
-        days_by_sap, sap_sheet, sap_rows = read_sap_file(sap_datei)
+        days_by_sap, sap_sheet, sap_rows, customer_info = read_sap_file(sap_datei)
         tour_df, tour_sheets = read_tourenplanung(tourenplanung_datei)
 
-        missing_sap = build_missing_in_sap(tour_df, days_by_sap)
-        missing_tour = build_missing_in_tour(tour_df, days_by_sap) if include_reverse else None
+        missing_sap = build_missing_in_sap(tour_df, days_by_sap, customer_info)
+        missing_tour = build_missing_in_tour(tour_df, days_by_sap, customer_info) if include_reverse else None
 
         excel_bytes = build_excel(missing_sap, missing_tour)
 
