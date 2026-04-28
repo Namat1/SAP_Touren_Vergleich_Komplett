@@ -432,6 +432,68 @@ def _empty_result_df() -> pd.DataFrame:
     return pd.DataFrame(columns=_export_columns_missing() + ["_HupaFlag"])
 
 
+def _add_count_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Fügt eine Hilfsspalte 'Anzahl LT' (Anzahl fehlender Liefertage) hinzu
+    und positioniert sie hinter 'SAP Nummer'."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    out["Anzahl LT"] = out["Fehlende LT"].fillna("").map(
+        lambda s: len([t for t in str(s).split(",") if t.strip()])
+    )
+    cols = list(out.columns)
+    cols.remove("Anzahl LT")
+    if "SAP Nummer" in cols:
+        idx = cols.index("SAP Nummer") + 1
+        cols.insert(idx, "Anzahl LT")
+    else:
+        cols.insert(0, "Anzahl LT")
+    return out[cols]
+
+
+def _filter_dataframe(df: pd.DataFrame, suche: str, standort: Optional[str] = None) -> pd.DataFrame:
+    """Filtert nach freitext (SAP, Name, Straße, Ort) und optional Standort."""
+    if df is None or df.empty:
+        return df
+    work = df
+    if standort and standort != "Alle" and "Standort" in work.columns:
+        work = work[work["Standort"] == standort]
+    if suche:
+        such = suche.strip().lower()
+        if such:
+            spalten = [c for c in ["SAP Nummer", "Name", "Straße", "Ort"] if c in work.columns]
+            mask = pd.Series(False, index=work.index)
+            for c in spalten:
+                mask = mask | work[c].astype(str).str.lower().str.contains(such, na=False)
+            work = work[mask]
+    return work
+
+
+def _standort_uebersicht(hupa_sap: pd.DataFrame, hupa_tour: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Aggregiert pro Standort: Anzahl betroffener Kunden in beiden Richtungen."""
+    rows = []
+    standorte = list(CUSTOMER_GROUPS.keys())
+    for standort in standorte:
+        gesamt = len(CUSTOMER_GROUPS[standort])
+        betr_sap = (
+            int((hupa_sap["Standort"] == standort).sum())
+            if hupa_sap is not None and not hupa_sap.empty and "Standort" in hupa_sap.columns
+            else 0
+        )
+        betr_tour = (
+            int((hupa_tour["Standort"] == standort).sum())
+            if hupa_tour is not None and not hupa_tour.empty and "Standort" in hupa_tour.columns
+            else 0
+        )
+        rows.append({
+            "Standort": standort,
+            "Kunden gesamt": gesamt,
+            "Fehlt in SAP": betr_sap,
+            "Fehlt in Tour": betr_tour,
+        })
+    return pd.DataFrame(rows)
+
+
 def build_excel(
     missing_sap: pd.DataFrame,
     missing_tour: pd.DataFrame | None,
@@ -707,72 +769,6 @@ if run:
         with st.expander("Technische Details", expanded=False):
             st.code(traceback.format_exc(), language="python")
         st.session_state.pop("result", None)
-
-# ---------------------------------------------------------------------------
-# Helfer für die Ergebnisanzeige
-# ---------------------------------------------------------------------------
-
-def _add_count_column(df: pd.DataFrame) -> pd.DataFrame:
-    """Fügt eine Hilfsspalte 'Anzahl LT' (Anzahl fehlender Liefertage) hinzu
-    und positioniert sie hinter 'SAP Nummer'."""
-    if df is None or df.empty:
-        return df
-    out = df.copy()
-    out["Anzahl LT"] = out["Fehlende LT"].fillna("").map(
-        lambda s: len([t for t in str(s).split(",") if t.strip()])
-    )
-    cols = list(out.columns)
-    cols.remove("Anzahl LT")
-    if "SAP Nummer" in cols:
-        idx = cols.index("SAP Nummer") + 1
-        cols.insert(idx, "Anzahl LT")
-    else:
-        cols.insert(0, "Anzahl LT")
-    return out[cols]
-
-
-def _filter_dataframe(df: pd.DataFrame, suche: str, standort: Optional[str] = None) -> pd.DataFrame:
-    """Filtert nach freitext (SAP, Name, Straße, Ort) und optional Standort."""
-    if df is None or df.empty:
-        return df
-    work = df
-    if standort and standort != "Alle" and "Standort" in work.columns:
-        work = work[work["Standort"] == standort]
-    if suche:
-        such = suche.strip().lower()
-        if such:
-            spalten = [c for c in ["SAP Nummer", "Name", "Straße", "Ort"] if c in work.columns]
-            mask = pd.Series(False, index=work.index)
-            for c in spalten:
-                mask = mask | work[c].astype(str).str.lower().str.contains(such, na=False)
-            work = work[mask]
-    return work
-
-
-def _standort_uebersicht(hupa_sap: pd.DataFrame, hupa_tour: Optional[pd.DataFrame]) -> pd.DataFrame:
-    """Aggregiert pro Standort: Anzahl betroffener Kunden in beiden Richtungen."""
-    rows = []
-    standorte = list(CUSTOMER_GROUPS.keys())
-    for standort in standorte:
-        gesamt = len(CUSTOMER_GROUPS[standort])
-        betr_sap = (
-            int((hupa_sap["Standort"] == standort).sum())
-            if hupa_sap is not None and not hupa_sap.empty and "Standort" in hupa_sap.columns
-            else 0
-        )
-        betr_tour = (
-            int((hupa_tour["Standort"] == standort).sum())
-            if hupa_tour is not None and not hupa_tour.empty and "Standort" in hupa_tour.columns
-            else 0
-        )
-        rows.append({
-            "Standort": standort,
-            "Kunden gesamt": gesamt,
-            "Fehlt in SAP": betr_sap,
-            "Fehlt in Tour": betr_tour,
-        })
-    return pd.DataFrame(rows)
-
 
 # ---------------------------------------------------------------------------
 # Ergebnisanzeige
