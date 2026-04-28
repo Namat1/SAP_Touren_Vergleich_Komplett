@@ -4,7 +4,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 import streamlit as st
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 # ---------------------------------------------------------------------------
@@ -432,19 +432,6 @@ def _empty_result_df() -> pd.DataFrame:
     return pd.DataFrame(columns=_export_columns_missing() + ["_HupaFlag"])
 
 
-def interleave_blank_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """Fügt nach jeder Datenzeile außer der letzten eine komplett leere Zeile ein."""
-    if df.empty or len(df) <= 1:
-        return df.reset_index(drop=True)
-    blank = pd.DataFrame([[pd.NA] * len(df.columns)], columns=df.columns)
-    pieces: List[pd.DataFrame] = []
-    for i in range(len(df)):
-        pieces.append(df.iloc[[i]])
-        if i < len(df) - 1:
-            pieces.append(blank)
-    return pd.concat(pieces, ignore_index=True)
-
-
 def build_excel(
     missing_sap: pd.DataFrame,
     missing_tour: pd.DataFrame | None,
@@ -455,56 +442,144 @@ def build_excel(
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        hupa_out = interleave_blank_rows(hupa_sap)
+        hupa_out = _add_count_column(hupa_sap)
         hupa_out.to_excel(writer, index=False, sheet_name="Hupa", na_rep="")
         _format_sheet(writer, "Hupa", hupa_out)
 
-        direkt_out = interleave_blank_rows(direkt_sap)
+        direkt_out = _add_count_column(direkt_sap)
         direkt_out.to_excel(writer, index=False, sheet_name="Direkt", na_rep="")
         _format_sheet(writer, "Direkt", direkt_out)
 
         if missing_tour is not None:
             hupa_tour, direkt_tour = split_hupa_direkt(missing_tour)
 
-            hupa_tour_out = interleave_blank_rows(hupa_tour)
+            hupa_tour_out = _add_count_column(hupa_tour)
             hupa_tour_out.to_excel(writer, index=False, sheet_name="Hupa - Fehlt in Tour", na_rep="")
             _format_sheet(writer, "Hupa - Fehlt in Tour", hupa_tour_out)
 
-            direkt_tour_out = interleave_blank_rows(direkt_tour)
+            direkt_tour_out = _add_count_column(direkt_tour)
             direkt_tour_out.to_excel(writer, index=False, sheet_name="Direkt - Fehlt in Tour", na_rep="")
             _format_sheet(writer, "Direkt - Fehlt in Tour", direkt_tour_out)
 
     return output.getvalue()
 
 
+# Spalten, die rechtsbündig dargestellt werden (Zahlen)
+_RIGHT_ALIGN_COLS = {"SAP Nummer", "Anzahl LT"}
+
+# Empfohlene Mindest-/Maximal-Breiten je Spalte
+_COL_WIDTH_HINTS = {
+    "Standort": (12, 16),
+    "SAP Nummer": (10, 12),
+    "Anzahl LT": (10, 11),
+    "Name": (24, 42),
+    "Straße": (20, 32),
+    "Ort": (22, 36),
+    "Fehlende LT": (24, 48),
+    "LT SAP": (24, 48),
+    "LT Tourenplanung": (24, 48),
+}
+
+
 def _format_sheet(writer, sheet_name: str, df: pd.DataFrame) -> None:
     if df is None:
         return
     ws = writer.sheets[sheet_name]
+    n_rows = len(df)
+    n_cols = len(df.columns)
+
+    # Farben
+    header_fill = PatternFill(start_color="FF305496", end_color="FF305496", fill_type="solid")
+    zebra_fill = PatternFill(start_color="FFE8EFF7", end_color="FFE8EFF7", fill_type="solid")
+
+    # Borders
+    thin = Side(style="thin", color="FFCBD5E0")
+    medium = Side(style="medium", color="FF305496")
+    border_thin = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFFFF")
+    body_font = Font(name="Calibri", size=11)
+    align_left = Alignment(horizontal="left", vertical="center", wrap_text=False)
+    align_right = Alignment(horizontal="right", vertical="center", wrap_text=False)
+    align_center = Alignment(horizontal="center", vertical="center", wrap_text=False)
 
     # Header formatieren
-    header_fill = PatternFill(start_color="FF305496", end_color="FF305496", fill_type="solid")
-    header_font = Font(bold=True, color="FFFFFFFF")
-    header_align = Alignment(horizontal="left", vertical="center")
-    for col_idx in range(1, len(df.columns) + 1):
+    for col_idx in range(1, n_cols + 1):
         cell = ws.cell(row=1, column=col_idx)
         cell.fill = header_fill
         cell.font = header_font
-        cell.alignment = header_align
+        cell.alignment = align_left
+        cell.border = border_thin
+    ws.row_dimensions[1].height = 24
 
-    # Spaltenbreiten grob an Inhaltslänge
-    for col_idx, col_name in enumerate(df.columns, start=1):
-        max_len = max(
-            [len(str(col_name))] +
-            [len(str(v)) for v in df[col_name].astype(str).head(200).tolist()]
-        )
-        ws.column_dimensions[get_column_letter(col_idx)].width = min(max(max_len + 2, 12), 60)
+    # Standort-Spalte ermitteln (für dicke Trennlinie bei Wechsel)
+    columns = list(df.columns)
+    standort_idx = columns.index("Standort") if "Standort" in columns else None
+    standort_values = df["Standort"].tolist() if standort_idx is not None else []
+
+    # Datenzeilen formatieren
+    for row_offset in range(n_rows):
+        excel_row = row_offset + 2
+        is_zebra = (row_offset % 2) == 1
+
+        # Trennt sich der Standort zur Vorzeile? -> dicke obere Linie
+        new_group = False
+        if standort_idx is not None and row_offset > 0:
+            if standort_values[row_offset] != standort_values[row_offset - 1]:
+                new_group = True
+
+        ws.row_dimensions[excel_row].height = 20
+
+        for col_idx, col_name in enumerate(columns, start=1):
+            cell = ws.cell(row=excel_row, column=col_idx)
+            cell.font = body_font
+
+            if col_name == "Anzahl LT":
+                cell.alignment = align_center
+            elif col_name in _RIGHT_ALIGN_COLS:
+                cell.alignment = align_right
+            else:
+                cell.alignment = align_left
+
+            if is_zebra:
+                cell.fill = zebra_fill
+
+            top_side = medium if new_group else thin
+            cell.border = Border(left=thin, right=thin, top=top_side, bottom=thin)
+
+    # Spaltenbreiten: Hinweise + Inhaltslänge
+    for col_idx, col_name in enumerate(columns, start=1):
+        sample = df[col_name].astype(str).head(300).tolist()
+        max_len = max([len(str(col_name))] + [len(v) for v in sample] + [8])
+        min_w, max_w = _COL_WIDTH_HINTS.get(col_name, (12, 50))
+        width = min(max(max_len + 3, min_w), max_w)
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
 
     # Kopfzeile einfrieren + Autofilter
     ws.freeze_panes = "A2"
-    if not df.empty:
-        last_col = get_column_letter(len(df.columns))
-        ws.auto_filter.ref = f"A1:{last_col}{len(df) + 1}"
+    if n_rows > 0:
+        last_col = get_column_letter(n_cols)
+        ws.auto_filter.ref = f"A1:{last_col}{n_rows + 1}"
+
+    # Conditional Formatting für 'Anzahl LT': je höher, desto roter
+    if "Anzahl LT" in columns and n_rows > 0:
+        from openpyxl.formatting.rule import ColorScaleRule
+        col_letter = get_column_letter(columns.index("Anzahl LT") + 1)
+        rng = f"{col_letter}2:{col_letter}{n_rows + 1}"
+        rule = ColorScaleRule(
+            start_type="num", start_value=1, start_color="FFD4EDDA",
+            mid_type="num", mid_value=3, mid_color="FFFFE699",
+            end_type="num", end_value=6, end_color="FFF4B084",
+        )
+        ws.conditional_formatting.add(rng, rule)
+
+    # Druckeinstellungen: querformat, an Breite anpassen
+    ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.print_options.gridLines = False
+    ws.print_title_rows = "1:1"
 
 
 def build_group_overview() -> str:
