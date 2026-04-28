@@ -461,6 +461,17 @@ def build_excel(
             direkt_tour_out.to_excel(writer, index=False, sheet_name="Direkt - Fehlt in Tour", na_rep="")
             _format_sheet(writer, "Direkt - Fehlt in Tour", direkt_tour_out)
 
+        # Defensiv: alle Sheets sichtbar; falls openpyxl ein Default-Sheet "Sheet"
+        # angelegt hat und es noch leer ist, entfernen.
+        wb = writer.book
+        for ws in list(wb.worksheets):
+            if ws.title == "Sheet" and ws.max_row == 1 and ws.max_column == 1:
+                wb.remove(ws)
+        for ws in wb.worksheets:
+            ws.sheet_state = "visible"
+        if not wb.worksheets:
+            wb.create_sheet("Hupa")
+
     return output.getvalue()
 
 
@@ -573,13 +584,20 @@ def _format_sheet(writer, sheet_name: str, df: pd.DataFrame) -> None:
         )
         ws.conditional_formatting.add(rng, rule)
 
-    # Druckeinstellungen: querformat, an Breite anpassen
-    ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
-    ws.page_setup.fitToWidth = 1
-    ws.page_setup.fitToHeight = 0
-    ws.sheet_properties.pageSetUpPr.fitToPage = True
-    ws.print_options.gridLines = False
-    ws.print_title_rows = "1:1"
+    # Druck: Querformat und Kopfzeile auf jeder Seite. Defensiv ohne Properties,
+    # die in manchen openpyxl-Versionen "At least one sheet must be visible" auslösen.
+    try:
+        ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
+        ws.print_options.gridLines = False
+        if n_rows > 0:
+            ws.print_title_rows = "1:1"
+    except Exception:
+        # Druckeinstellungen sind nice-to-have, blockieren aber niemals den Export
+        pass
+
+    # Sicherstellen, dass das Sheet sichtbar ist (sonst kann openpyxl
+    # beim Speichern "At least one sheet must be visible" werfen)
+    ws.sheet_state = "visible"
 
 
 def build_group_overview() -> str:
@@ -684,7 +702,10 @@ if run:
             "tour_sheets": tour_sheets,
         }
     except Exception as exc:
+        import traceback
         st.error(f"Fehler beim Verarbeiten der Dateien: {exc}")
+        with st.expander("Technische Details", expanded=False):
+            st.code(traceback.format_exc(), language="python")
         st.session_state.pop("result", None)
 
 # ---------------------------------------------------------------------------
