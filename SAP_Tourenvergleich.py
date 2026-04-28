@@ -612,46 +612,181 @@ if run:
         st.error(f"Fehler beim Verarbeiten der Dateien: {exc}")
         st.session_state.pop("result", None)
 
+# ---------------------------------------------------------------------------
+# Helfer für die Ergebnisanzeige
+# ---------------------------------------------------------------------------
+
+def _add_count_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Fügt eine Hilfsspalte 'Anzahl LT' (Anzahl fehlender Liefertage) hinzu
+    und positioniert sie hinter 'SAP Nummer'."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    out["Anzahl LT"] = out["Fehlende LT"].fillna("").map(
+        lambda s: len([t for t in str(s).split(",") if t.strip()])
+    )
+    cols = list(out.columns)
+    cols.remove("Anzahl LT")
+    if "SAP Nummer" in cols:
+        idx = cols.index("SAP Nummer") + 1
+        cols.insert(idx, "Anzahl LT")
+    else:
+        cols.insert(0, "Anzahl LT")
+    return out[cols]
+
+
+def _filter_dataframe(df: pd.DataFrame, suche: str, standort: Optional[str] = None) -> pd.DataFrame:
+    """Filtert nach freitext (SAP, Name, Straße, Ort) und optional Standort."""
+    if df is None or df.empty:
+        return df
+    work = df
+    if standort and standort != "Alle" and "Standort" in work.columns:
+        work = work[work["Standort"] == standort]
+    if suche:
+        such = suche.strip().lower()
+        if such:
+            spalten = [c for c in ["SAP Nummer", "Name", "Straße", "Ort"] if c in work.columns]
+            mask = pd.Series(False, index=work.index)
+            for c in spalten:
+                mask = mask | work[c].astype(str).str.lower().str.contains(such, na=False)
+            work = work[mask]
+    return work
+
+
+def _standort_uebersicht(hupa_sap: pd.DataFrame, hupa_tour: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Aggregiert pro Standort: Anzahl betroffener Kunden in beiden Richtungen."""
+    rows = []
+    standorte = list(CUSTOMER_GROUPS.keys())
+    for standort in standorte:
+        gesamt = len(CUSTOMER_GROUPS[standort])
+        betr_sap = (
+            int((hupa_sap["Standort"] == standort).sum())
+            if hupa_sap is not None and not hupa_sap.empty and "Standort" in hupa_sap.columns
+            else 0
+        )
+        betr_tour = (
+            int((hupa_tour["Standort"] == standort).sum())
+            if hupa_tour is not None and not hupa_tour.empty and "Standort" in hupa_tour.columns
+            else 0
+        )
+        rows.append({
+            "Standort": standort,
+            "Kunden gesamt": gesamt,
+            "Fehlt in SAP": betr_sap,
+            "Fehlt in Tour": betr_tour,
+        })
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
 # Ergebnisanzeige
+# ---------------------------------------------------------------------------
+
 result = st.session_state.get("result")
 if result:
     hupa_sap = result["hupa_sap"]
     direkt_sap = result["direkt_sap"]
     hupa_tour = result["hupa_tour"]
     direkt_tour = result["direkt_tour"]
+    has_reverse = hupa_tour is not None or direkt_tour is not None
 
-    st.success(
-        f"Fertig. Hupa: {len(hupa_sap)} Kunden, Direkt: {len(direkt_sap)} Kunden "
-        f"mit Tagen in der Tourenplanung, die in SAP als Liefertag fehlen."
-    )
+    st.divider()
 
-    st.caption(
-        f"SAP: Blatt = {result['sap_sheet']}, {result['sap_rows']} Liefertage übernommen | "
-        f"Tourenplanung: geprüfte Blätter = {', '.join(result['tour_sheets'])}"
-    )
+    # Kopfzeile: Kennzahlen + Download
+    head_left, head_right = st.columns([3, 1])
+    with head_left:
+        st.subheader("Ergebnis")
+        st.caption(
+            f"SAP: Blatt **{result['sap_sheet']}**, {result['sap_rows']} Liefertage übernommen · "
+            f"Tourenplanung: {', '.join(result['tour_sheets'])}"
+        )
+    with head_right:
+        st.download_button(
+            label="📥 Excel herunterladen",
+            data=result["excel_bytes"],
+            file_name="tourenplanung_sap_hupa_direkt.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
 
-    if not hupa_sap.empty:
-        with st.expander(f"Vorschau: Hupa ({len(hupa_sap)} Kunden)", expanded=False):
+    # Hauptkennzahlen
+    if has_reverse:
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Hupa – Fehlt in SAP", len(hupa_sap) if hupa_sap is not None else 0)
+        m2.metric("Direkt – Fehlt in SAP", len(direkt_sap) if direkt_sap is not None else 0)
+        m3.metric("Hupa – Fehlt in Tour", len(hupa_tour) if hupa_tour is not None else 0)
+        m4.metric("Direkt – Fehlt in Tour", len(direkt_tour) if direkt_tour is not None else 0)
+    else:
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Hupa betroffen", len(hupa_sap) if hupa_sap is not None else 0)
+        m2.metric("Direkt betroffen", len(direkt_sap) if direkt_sap is not None else 0)
+        m3.metric("Summe", (len(hupa_sap) if hupa_sap is not None else 0) + (len(direkt_sap) if direkt_sap is not None else 0))
+
+    # Tabs für die Detailansichten
+    tab_labels = [
+        "📊 Übersicht",
+        f"🟢 Hupa · Fehlt in SAP ({len(hupa_sap)})",
+        f"🟡 Direkt · Fehlt in SAP ({len(direkt_sap)})",
+    ]
+    if has_reverse:
+        tab_labels.append(f"🔵 Hupa · Fehlt in Tour ({len(hupa_tour) if hupa_tour is not None else 0})")
+        tab_labels.append(f"🟣 Direkt · Fehlt in Tour ({len(direkt_tour) if direkt_tour is not None else 0})")
+
+    tabs = st.tabs(tab_labels)
+
+    # --- Tab Übersicht ---
+    with tabs[0]:
+        ueb = _standort_uebersicht(hupa_sap, hupa_tour)
+        st.markdown("**Pro Standort betroffene Kunden**")
+        st.dataframe(ueb, use_container_width=True, hide_index=True)
+
+        if hupa_sap is None or hupa_sap.empty:
+            st.success("✅ Keine Hupa-Kunden mit Tagen in der Tourenplanung, die in SAP fehlen.")
+        if direkt_sap is None or direkt_sap.empty:
+            st.success("✅ Keine Direkt-Kunden mit Tagen in der Tourenplanung, die in SAP fehlen.")
+
+    # --- Tab Hupa Fehlt in SAP ---
+    with tabs[1]:
+        if hupa_sap is None or hupa_sap.empty:
+            st.info("Keine Treffer.")
+        else:
+            f1, f2 = st.columns([1, 2])
             standorte = ["Alle"] + sorted(hupa_sap["Standort"].unique().tolist())
-            filter_wahl = st.selectbox("Standort filtern", standorte, key="filter_hupa")
-            vorschau = hupa_sap if filter_wahl == "Alle" else hupa_sap[hupa_sap["Standort"] == filter_wahl]
-            st.dataframe(vorschau, use_container_width=True, hide_index=True)
+            standort_wahl = f1.selectbox("Standort", standorte, key="filter_hupa_sap_standort")
+            suche = f2.text_input("Suchen (SAP, Name, Straße, Ort)", key="filter_hupa_sap_suche")
+            anz = _add_count_column(_filter_dataframe(hupa_sap, suche, standort_wahl))
+            st.caption(f"{len(anz)} von {len(hupa_sap)} Zeilen")
+            st.dataframe(anz, use_container_width=True, hide_index=True)
 
-    if not direkt_sap.empty:
-        with st.expander(f"Vorschau: Direkt ({len(direkt_sap)} Kunden)", expanded=False):
-            st.dataframe(direkt_sap, use_container_width=True, hide_index=True)
+    # --- Tab Direkt Fehlt in SAP ---
+    with tabs[2]:
+        if direkt_sap is None or direkt_sap.empty:
+            st.info("Keine Treffer.")
+        else:
+            suche = st.text_input("Suchen (SAP, Name, Straße, Ort)", key="filter_direkt_sap_suche")
+            anz = _add_count_column(_filter_dataframe(direkt_sap, suche))
+            st.caption(f"{len(anz)} von {len(direkt_sap)} Zeilen")
+            st.dataframe(anz, use_container_width=True, hide_index=True)
 
-    if hupa_tour is not None and not hupa_tour.empty:
-        with st.expander(f"Vorschau: Hupa - Fehlt in Tour ({len(hupa_tour)} Kunden)", expanded=False):
-            st.dataframe(hupa_tour, use_container_width=True, hide_index=True)
+    # --- Tabs Reverse (optional) ---
+    if has_reverse:
+        with tabs[3]:
+            if hupa_tour is None or hupa_tour.empty:
+                st.info("Keine Treffer.")
+            else:
+                f1, f2 = st.columns([1, 2])
+                standorte = ["Alle"] + sorted(hupa_tour["Standort"].unique().tolist())
+                standort_wahl = f1.selectbox("Standort", standorte, key="filter_hupa_tour_standort")
+                suche = f2.text_input("Suchen (SAP, Name, Straße, Ort)", key="filter_hupa_tour_suche")
+                anz = _add_count_column(_filter_dataframe(hupa_tour, suche, standort_wahl))
+                st.caption(f"{len(anz)} von {len(hupa_tour)} Zeilen")
+                st.dataframe(anz, use_container_width=True, hide_index=True)
 
-    if direkt_tour is not None and not direkt_tour.empty:
-        with st.expander(f"Vorschau: Direkt - Fehlt in Tour ({len(direkt_tour)} Kunden)", expanded=False):
-            st.dataframe(direkt_tour, use_container_width=True, hide_index=True)
-
-    st.download_button(
-        label="Excel herunterladen",
-        data=result["excel_bytes"],
-        file_name="tourenplanung_sap_hupa_direkt.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+        with tabs[4]:
+            if direkt_tour is None or direkt_tour.empty:
+                st.info("Keine Treffer.")
+            else:
+                suche = st.text_input("Suchen (SAP, Name, Straße, Ort)", key="filter_direkt_tour_suche")
+                anz = _add_count_column(_filter_dataframe(direkt_tour, suche))
+                st.caption(f"{len(anz)} von {len(direkt_tour)} Zeilen")
+                st.dataframe(anz, use_container_width=True, hide_index=True)
