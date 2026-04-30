@@ -48,6 +48,9 @@ DAY_NAMES = {
     6: "Samstag",
 }
 
+# Fallback-Positionen, falls Spaltenüberschriften nicht erkannt werden.
+# Index 0 = Spalte A. In der neuen Quelldatei ist:
+# A CSB, B SAP, C Name, D Strasse, E Plz, F Ort, G Mo, H Die, I Mitt, J Don, K Fr, L Sam.
 DAY_COLUMNS_TOUR = {
     1: 6,
     2: 7,
@@ -60,6 +63,25 @@ DAY_COLUMNS_TOUR = {
 SAP_COL_INDEX = 0
 SAP_DAY_COL_INDEX = 6
 TOUR_SAP_COL_INDEX = 1
+
+# Diese Blätter werden aus der Quelldatei gelesen.
+# Alles andere wie LADEREIHENFOLGE, KUNDENDATEN, TBS_DRUCK usw. wird ignoriert.
+TOUR_SHEET_CANDIDATES = [
+    "DIREKT",
+    "MK",
+    "HUPA_NMS",
+    "HUPA_MALCHOW",
+]
+
+# Neue kurze Tagesüberschriften aus der Quelldatei.
+DAY_COLUMN_CANDIDATES = {
+    1: ["mo", "montag"],
+    2: ["die", "di", "dienstag"],
+    3: ["mitt", "mit", "mi", "mittwoch"],
+    4: ["don", "do", "donnerstag"],
+    5: ["fr", "frei", "freitag"],
+    6: ["sam", "sa", "samstag"],
+}
 
 LOCATION_ORDER = {name: index for index, name in enumerate(CUSTOMER_GROUPS.keys(), start=1)}
 CUSTOMER_TO_LOCATION: Dict[str, str] = {}
@@ -127,6 +149,129 @@ def pick_first_matching_column(columns: List[str], candidates: List[str]) -> Opt
     return None
 
 
+def make_unique_columns(raw_columns: List[object]) -> List[str]:
+    """Erzeugt eindeutige Spaltennamen, auch wenn Excel leere/gleiche Überschriften enthält."""
+    result: List[str] = []
+    seen: Dict[str, int] = {}
+    for index, value in enumerate(raw_columns, start=1):
+        name = value_to_clean_text(value)
+        if not name:
+            name = f"Spalte_{index}"
+        count = seen.get(name, 0) + 1
+        seen[name] = count
+        if count > 1:
+            name = f"{name}_{count}"
+        result.append(name)
+    return result
+
+
+def normalized_candidates(values: List[str]) -> List[str]:
+    return [normalize_header_name(value) for value in values]
+
+
+def pick_column_by_name_or_position(
+    columns: List[str],
+    candidates: List[str],
+    fallback_index: Optional[int] = None,
+) -> Optional[str]:
+    """Findet eine Spalte zuerst per Überschrift, sonst per alter Position."""
+    found = pick_first_matching_column(columns, normalized_candidates(candidates))
+    if found is not None:
+        return found
+    if fallback_index is not None and len(columns) > fallback_index:
+        return columns[fallback_index]
+    return None
+
+
+def read_excel_with_detected_header(excel: pd.ExcelFile, sheet_name: str) -> pd.DataFrame:
+    """Liest ein Blatt und erkennt die Kopfzeile selbst.
+
+    Das ist wichtig, wenn oberhalb der eigentlichen Tabelle noch Leerzeilen,
+    Filterzeilen oder Druck-Kopfbereiche stehen. Gesucht wird eine Zeile mit
+    SAP und mindestens zwei Tages-Spalten wie Mo, Die, Mitt, Don, Fr, Sam.
+    """
+    raw = pd.read_excel(excel, sheet_name=sheet_name, header=None, dtype=object)
+    if raw.empty:
+        return pd.DataFrame()
+
+    header_row: Optional[int] = None
+    max_scan_rows = min(len(raw), 25)
+    day_names_flat = {
+        normalize_header_name(candidate)
+        for values in DAY_COLUMN_CANDIDATES.values()
+        for candidate in values
+    }
+
+    for row_index in range(max_scan_rows):
+        values = [normalize_header_name(value) for value in raw.iloc[row_index].tolist()]
+        value_set = set(values)
+        has_sap = "sap" in value_set or "sapnummer" in value_set or "sapnr" in value_set
+        day_hits = sum(1 for value in values if value in day_names_flat)
+        if has_sap and day_hits >= 2:
+            header_row = row_index
+            break
+
+    if header_row is None:
+        # Fallback: wie vorher mit erster Zeile als Kopfzeile.
+        return pd.read_excel(excel, sheet_name=sheet_name, header=0, dtype=object)
+
+    df = raw.iloc[header_row + 1:].copy()
+    df.columns = make_unique_columns(raw.iloc[header_row].tolist())
+    df = df.dropna(how="all").reset_index(drop=True)
+    return df
+
+
+def select_tour_sheet_names(excel: pd.ExcelFile) -> List[str]:
+    """Wählt nur die echten Quelldatei-Blätter aus."""
+    available_by_normalized = {normalize_header_name(name): name for name in excel.sheet_names}
+    selected: List[str] = []
+
+    for expected in TOUR_SHEET_CANDIDATES:
+        real_name = available_by_normalized.get(normalize_header_name(expected))
+        if real_name and real_name not in selected:
+            selected.append(real_name)
+
+    if selected:
+        return selected
+
+    # Fallback, falls die Datei anders benannt wurde: die ersten vier Blätter wie bisher.
+    return excel.sheet_names[:4]
+
+
+def day_value_is_set(value) -> bool:
+    """Ein Tag gilt als vorhanden, wenn in Mo/Die/Mitt/Don/Fr/Sam irgendein Wert steht.
+
+    Tournummern wie 1028, 2063, 3028 zählen. 0, leere Zellen und Striche zählen nicht.
+    """
+    if value is None or pd.isna(value):
+        return False
+    text = str(value).strip()
+    if not text:
+        return False
+    if text.lower() in {"nan", "none", "<na>", "-", "--"}:
+        return False
+    number = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.notna(number) and float(number) == 0:
+        return False
+    return True
+
+
+def normalize_day_code_series(series: pd.Series) -> pd.Series:
+    """Normalisiert Liefertage aus SAP: 1..6 oder Text wie Montag/Mo."""
+    numeric = pd.to_numeric(series, errors="coerce")
+    text = series.astype(str).map(normalize_header_name)
+    text_map = {
+        "1": 1, "mo": 1, "montag": 1,
+        "2": 2, "di": 2, "die": 2, "dienstag": 2,
+        "3": 3, "mi": 3, "mitt": 3, "mit": 3, "mittwoch": 3,
+        "4": 4, "do": 4, "don": 4, "donnerstag": 4,
+        "5": 5, "fr": 5, "frei": 5, "freitag": 5,
+        "6": 6, "sa": 6, "sam": 6, "samstag": 6,
+    }
+    mapped = text.map(text_map)
+    return numeric.where(numeric.notna(), mapped)
+
+
 def value_to_clean_text(value) -> str:
     if value is None or pd.isna(value):
         return ""
@@ -143,27 +288,45 @@ def merge_customer_info(base: Dict[str, Dict[str, str]], sap: str, info: Dict[st
 
 
 def read_sap_file(uploaded_file) -> Tuple[Dict[str, Set[int]], str, int]:
-    """Liest die SAP-Datei: Spalte A = SAP, G = Liefertag 1..6.
-    Name, Straße und Ort werden bewusst nicht aus SAP übernommen."""
+    """Liest die SAP-Datei.
+
+    Bevorzugt werden Spaltenüberschriften wie SAP und Liefertag. Falls die
+    Überschriften anders heißen, wird auf die alte Struktur zurückgefallen:
+    Spalte A = SAP, Spalte G = Liefertag 1 bis 6.
+    """
     excel = pd.ExcelFile(uploaded_file)
     sheet_name = excel.sheet_names[0]
-    df = pd.read_excel(
-        excel,
-        sheet_name=sheet_name,
-        header=0,
-        usecols=[SAP_COL_INDEX, SAP_DAY_COL_INDEX],
-        names=["sap", "tag"],
+    df = read_excel_with_detected_header(excel, sheet_name)
+
+    if df.empty:
+        return {}, sheet_name, 0
+
+    columns = list(df.columns)
+    sap_column = pick_column_by_name_or_position(
+        columns,
+        ["SAP", "SAP Nummer", "SAP-Nr", "SAP Nr", "Kundennummer", "Kunden Nummer"],
+        SAP_COL_INDEX,
+    )
+    day_column = pick_column_by_name_or_position(
+        columns,
+        ["Liefertag", "Liefer Tag", "LT", "Tag", "Liefertag Code", "Liefertagcode"],
+        SAP_DAY_COL_INDEX,
     )
 
-    df["sap"] = normalize_sap_series(df["sap"])
-    df["tag_num"] = pd.to_numeric(df["tag"], errors="coerce")
+    if sap_column is None or day_column is None:
+        return {}, sheet_name, 0
+
+    work = df[[sap_column, day_column]].copy()
+    work.columns = ["sap", "tag"]
+    work["sap"] = normalize_sap_series(work["sap"])
+    work["tag_num"] = normalize_day_code_series(work["tag"])
 
     mask = (
-        df["sap"].ne("")
-        & df["tag_num"].between(1, 6, inclusive="both")
-        & df["tag_num"].notna()
+        work["sap"].ne("")
+        & work["tag_num"].between(1, 6, inclusive="both")
+        & work["tag_num"].notna()
     )
-    filtered = df.loc[mask, ["sap", "tag_num"]].copy()
+    filtered = work.loc[mask, ["sap", "tag_num"]].copy()
     filtered["tag_int"] = filtered["tag_num"].astype(int)
 
     days_by_sap: Dict[str, Set[int]] = (
@@ -174,47 +337,61 @@ def read_sap_file(uploaded_file) -> Tuple[Dict[str, Set[int]], str, int]:
 
 
 def read_tourenplanung(uploaded_file) -> Tuple[pd.DataFrame, List[str], Dict[str, Dict[str, str]]]:
-    """Liest die ersten vier Blätter der Tourenplanung und gibt einen langen
-    DataFrame zurück: eine Zeile pro (SAP, Tag, Blatt) mit gesetztem Wert.
-    Zusätzlich werden Name, Straße und Ort möglichst aus den Überschriften der
-    Tourenplanung erkannt und pro SAP gesammelt."""
+    """Liest die neue Quelldatei.
+
+    Erwartet werden die Blätter DIREKT, MK, HUPA_NMS und HUPA_MALCHOW.
+    Die Spalten werden per Name erkannt:
+    CSB, SAP, Name, Strasse, Plz, Ort, Mo, Die, Mitt, Don, Fr, Sam.
+
+    Zusätzlich bleiben die alten Positionen als Fallback erhalten:
+    B = SAP und G bis L = Montag bis Samstag.
+    """
     excel = pd.ExcelFile(uploaded_file)
-    sheet_names = excel.sheet_names[:4]
+    sheet_names = select_tour_sheet_names(excel)
 
     frames: List[pd.DataFrame] = []
     customer_info: Dict[str, Dict[str, str]] = {}
 
     for sheet_name in sheet_names:
-        df = pd.read_excel(excel, sheet_name=sheet_name, header=0)
+        df = read_excel_with_detected_header(excel, sheet_name)
         if df.empty:
             continue
 
         columns = list(df.columns)
-        sap_column = columns[TOUR_SAP_COL_INDEX] if len(columns) > TOUR_SAP_COL_INDEX else None
+        sap_column = pick_column_by_name_or_position(
+            columns,
+            ["SAP", "SAP Nummer", "SAP-Nr", "SAP Nr", "Kundennummer", "Kunden Nummer"],
+            TOUR_SAP_COL_INDEX,
+        )
         if sap_column is None:
             continue
 
-        name_column = pick_first_matching_column(
+        csb_column = pick_column_by_name_or_position(columns, ["CSB", "CSB Nummer", "CSB-Nr", "CSB Nr"], 0)
+        name_column = pick_column_by_name_or_position(
             columns,
-            ["name", "kundenname", "marktname", "kunde", "bezeichnung", "filialname"],
+            ["Name", "Kundenname", "Marktname", "Kunde", "Bezeichnung", "Filialname"],
+            2,
         )
-        strasse_column = pick_first_matching_column(
+        strasse_column = pick_column_by_name_or_position(
             columns,
-            ["strasse", "str", "anschrift", "adresse", "strassenname", "strassehausnummer"],
+            ["Strasse", "Straße", "Str", "Anschrift", "Adresse", "Strassenname", "Straßenname", "Strasse Hausnummer", "Straße Hausnummer"],
+            3,
         )
-        ort_column = pick_first_matching_column(
-            columns,
-            ["ort", "stadt", "plzort", "ortname"],
-        )
-        plz_column = pick_first_matching_column(
-            columns,
-            ["plz", "postleitzahl"],
-        )
+        plz_column = pick_column_by_name_or_position(columns, ["Plz", "PLZ", "Postleitzahl"], 4)
+        ort_column = pick_column_by_name_or_position(columns, ["Ort", "Stadt", "Plz Ort", "PLZ Ort", "Ortname"], 5)
 
         rename_map = {sap_column: "sap"}
+        if csb_column and csb_column != sap_column:
+            rename_map[csb_column] = "csb"
+
         for day_num, col_index in DAY_COLUMNS_TOUR.items():
-            if len(columns) > col_index:
-                rename_map[columns[col_index]] = f"tag_{day_num}"
+            day_column = pick_column_by_name_or_position(
+                columns,
+                DAY_COLUMN_CANDIDATES[day_num],
+                col_index,
+            )
+            if day_column and day_column != sap_column:
+                rename_map[day_column] = f"tag_{day_num}"
 
         if name_column and name_column != sap_column:
             rename_map[name_column] = "name"
@@ -274,9 +451,9 @@ def read_tourenplanung(uploaded_file) -> Tuple[pd.DataFrame, List[str], Dict[str
             value_name="wert",
         )
         long["tag_num"] = long["tag_col"].str.replace("tag_", "", regex=False).astype(int)
-        long["wert_num"] = pd.to_numeric(long["wert"], errors="coerce")
+        long["wert_gesetzt"] = long["wert"].map(day_value_is_set)
 
-        long = long[long["sap"].ne("") & long["wert_num"].notna()]
+        long = long[long["sap"].ne("") & long["wert_gesetzt"]]
         frames.append(long[["sap", "blatt", "tag_num", "wert"]])
 
     if not frames:
@@ -695,11 +872,11 @@ if duplicates:
 
 st.info(
     "Richtung des Vergleichs:\n"
-    "- SAP = Datei mit SAP Nummer in A, Name in C, Straße in D, Ort in F, Liefertag in G\n"
-    "- Tourenplanung = Datei mit Spalte B sowie Montag bis Samstag in G bis L\n"
-    "- Ausgabe = zwei Blätter, Hupa (bekannte Standorte) und Direkt (Rest)\n"
-    "- Sortierung Hupa = Standort Malchow/Neumünster/Zarrentin, dann SAP-Nummer\n"
-    "- Sortierung Direkt = nur SAP-Nummer aufsteigend"
+    "- SAP = Datei mit SAP Nummer und Liefertag 1 bis 6. Falls die Überschriften anders sind, wird A = SAP und G = Liefertag genutzt.\n"
+    "- Quelldatei = Blätter DIREKT, MK, HUPA_NMS und HUPA_MALCHOW.\n"
+    "- Quelldatei-Spalten = CSB, SAP, Name, Strasse, Plz, Ort, Mo, Die, Mitt, Don, Fr, Sam.\n"
+    "- Ein Wert in Mo bis Sam zählt als Lieferung an diesem Tag.\n"
+    "- Ausgabe = zwei Blätter, Hupa (bekannte Standorte) und Direkt (Rest)."
 )
 
 col1, col2, col3 = st.columns(3)
@@ -722,7 +899,7 @@ sap_datei = st.file_uploader(
 )
 
 tourenplanung_datei = st.file_uploader(
-    "Tourenplanung hochladen – erste 4 Blätter, Spalte B = SAP Nummer, Spalte G bis L = Montag bis Samstag. Name, Straße und Ort werden ebenfalls hieraus gelesen.",
+    "Quelldatei hochladen – Blätter DIREKT, MK, HUPA_NMS, HUPA_MALCHOW; Spalten CSB, SAP, Name, Strasse, Plz, Ort, Mo, Die, Mitt, Don, Fr, Sam",
     type=["xlsx", "xlsm", "xls"],
     key="tourenplanung_datei",
 )
@@ -745,6 +922,15 @@ if run:
         days_by_sap, sap_sheet, sap_rows = read_sap_file(sap_datei)
         tour_df, tour_sheets, customer_info = read_tourenplanung(tourenplanung_datei)
 
+        if sap_rows == 0:
+            st.warning("In der SAP-Datei wurden keine gültigen Liefertage erkannt. Erwartet wird SAP Nummer und Liefertag 1 bis 6.")
+        if tour_df.empty:
+            st.warning(
+                "In der Quelldatei wurden keine gesetzten Liefertage erkannt. "
+                f"Geprüfte Blätter: {', '.join(tour_sheets)}. "
+                "Erwartete Spalten: CSB, SAP, Name, Strasse, Plz, Ort, Mo, Die, Mitt, Don, Fr, Sam."
+            )
+
         missing_sap = build_missing_in_sap(tour_df, days_by_sap, customer_info)
         missing_tour = build_missing_in_tour(tour_df, days_by_sap, customer_info) if include_reverse else None
 
@@ -762,6 +948,7 @@ if run:
             "sap_sheet": sap_sheet,
             "sap_rows": sap_rows,
             "tour_sheets": tour_sheets,
+            "tour_rows": len(tour_df),
         }
     except Exception as exc:
         import traceback
@@ -790,7 +977,7 @@ if result:
         st.subheader("Ergebnis")
         st.caption(
             f"SAP: Blatt **{result['sap_sheet']}**, {result['sap_rows']} Liefertage übernommen · "
-            f"Tourenplanung: {', '.join(result['tour_sheets'])}"
+            f"Quelldatei: {', '.join(result['tour_sheets'])}, {result.get('tour_rows', 0)} gesetzte Liefertage erkannt"
         )
     with head_right:
         st.download_button(
