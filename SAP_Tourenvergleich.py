@@ -675,8 +675,9 @@ def build_excel(
     missing_sap: pd.DataFrame,
     missing_tour: pd.DataFrame | None,
 ) -> bytes:
-    """Schreibt eine Excel mit je einem Blatt 'Hupa' und 'Direkt' für die
-    Standard-Richtung (Fehlt in SAP) und optional den zwei Reverse-Blättern."""
+    """Schreibt eine Excel mit je zwei Blättern pro Richtung:
+    - Hupa und Direkt für Tourenplanung -> SAP, also Fehlt in SAP.
+    - Hupa - Fehlt in Tour und Direkt - Fehlt in Tour für SAP -> Tourenplanung."""
     hupa_sap, direkt_sap = split_hupa_direkt(missing_sap)
 
     output = io.BytesIO()
@@ -856,8 +857,10 @@ st.set_page_config(page_title="Tourenplanung gegen SAP (Hupa + Direkt)", layout=
 
 st.title("Tourenplanung gegen SAP – alle SAP-Nummern")
 st.write(
-    "Vergleicht die Liefertage in der Tourenplanung gegen die in SAP hinterlegten Liefertage "
-    "für alle SAP-Nummern ohne Filter. "
+    "Vergleicht die Liefertage in beide Richtungen: "
+    "1. Tage stehen in der Tourenplanung, fehlen aber in SAP. "
+    "2. Tage stehen in SAP, fehlen aber in der Tourenplanung. "
+    "Geprüft werden alle SAP-Nummern ohne Filter. "
     "Name, Straße und Ort werden dabei aus der Tourenplanung gelesen. "
     "Kunden, die in den hinterlegten Standorten (Malchow, Neumünster, Zarrentin) gelistet sind, "
     "landen im Blatt **Hupa**. Alle anderen im Blatt **Direkt**."
@@ -872,11 +875,14 @@ if duplicates:
 
 st.info(
     "Richtung des Vergleichs:\n"
+    "- Geprüft wird immer in beide Richtungen.\n"
+    "- Fehlt in SAP = Tag steht in der Tourenplanung, fehlt aber in SAP.\n"
+    "- Fehlt in Tour = Tag steht in SAP, fehlt aber in der Tourenplanung.\n"
     "- SAP = Datei mit SAP Nummer und Liefertag 1 bis 6. Falls die Überschriften anders sind, wird A = SAP und G = Liefertag genutzt.\n"
     "- Quelldatei = Blätter DIREKT, MK, HUPA_NMS und HUPA_MALCHOW.\n"
     "- Quelldatei-Spalten = CSB, SAP, Name, Strasse, Plz, Ort, Mo, Die, Mitt, Don, Fr, Sam.\n"
     "- Ein Wert in Mo bis Sam zählt als Lieferung an diesem Tag.\n"
-    "- Ausgabe = zwei Blätter, Hupa (bekannte Standorte) und Direkt (Rest)."
+    "- Ausgabe = vier Blätter: Hupa, Direkt, Hupa - Fehlt in Tour und Direkt - Fehlt in Tour."
 )
 
 col1, col2, col3 = st.columns(3)
@@ -904,13 +910,6 @@ tourenplanung_datei = st.file_uploader(
     key="tourenplanung_datei",
 )
 
-with st.expander("Optionen", expanded=False):
-    include_reverse = st.checkbox(
-        "Zusätzlich prüfen: Tage, die in SAP stehen, aber in der Tourenplanung fehlen "
-        "(zwei weitere Blätter: 'Hupa - Fehlt in Tour', 'Direkt - Fehlt in Tour')",
-        value=False,
-    )
-
 run = st.button("Excel erzeugen", type="primary")
 
 if run:
@@ -931,13 +930,16 @@ if run:
                 "Erwartete Spalten: CSB, SAP, Name, Strasse, Plz, Ort, Mo, Die, Mitt, Don, Fr, Sam."
             )
 
+        # Immer beide Richtungen prüfen:
+        # 1. Tourenplanung -> SAP: Tage stehen in der Tourenplanung, fehlen aber in SAP.
+        # 2. SAP -> Tourenplanung: Tage stehen in SAP, fehlen aber in der Tourenplanung.
         missing_sap = build_missing_in_sap(tour_df, days_by_sap, customer_info)
-        missing_tour = build_missing_in_tour(tour_df, days_by_sap, customer_info) if include_reverse else None
+        missing_tour = build_missing_in_tour(tour_df, days_by_sap, customer_info)
 
         excel_bytes = build_excel(missing_sap, missing_tour)
 
         hupa_sap, direkt_sap = split_hupa_direkt(missing_sap)
-        hupa_tour, direkt_tour = (split_hupa_direkt(missing_tour) if missing_tour is not None else (None, None))
+        hupa_tour, direkt_tour = split_hupa_direkt(missing_tour)
 
         st.session_state["result"] = {
             "hupa_sap": hupa_sap,
